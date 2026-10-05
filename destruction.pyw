@@ -1,11 +1,21 @@
 """
 destruction.py - Low-CPU tail-to-head destruction animation logic and image caching.
 """
+import random
 import time
-from PIL import Image, ImageTk
+from PIL import Image, ImageChops, ImageTk
 
 RESAMPLING = getattr(Image, "Resampling", Image)
 BICUBIC = RESAMPLING.BICUBIC
+NEAREST = RESAMPLING.NEAREST
+
+# Deterioration look
+ASH_COLOR = (40, 32, 28)   # color segments rot toward
+ASH_MAX_BLEND = 0.35       # was 0.85, less darkening
+SHRINK_END = 0.2           # shrinks closer to the old behavior
+DISSOLVE_AMOUNT = 0.4      # 0 = no dissolve, 1 = full    # 0..1, how ashy they get at the end
+SHRINK_END = 0.55          # final size as a fraction of the original (1.0 = no shrink)
+CACHE_LIMIT = 600          # prevents unbounded growth from rotating images
 
 
 class DestructionAnimator:
@@ -16,6 +26,7 @@ class DestructionAnimator:
         self.deteriorate_delay = float(deteriorate_delay)
         self.deteriorate_duration = float(deteriorate_duration)
         
+        self._noise = {}
         self.is_destroying = False
         self.start_time = 0.0
         self._cache = {}
@@ -30,6 +41,7 @@ class DestructionAnimator:
 
     def reset(self):
         """Cancels destruction and resets back to normal state."""
+        self._noise.clear()
         self.is_destroying = False
         self.start_time = 0.0
         self._cache.clear()
@@ -68,47 +80,60 @@ class DestructionAnimator:
         if segment_index not in self.detach_times:
             self.detach_times[segment_index] = time.time()
 
+    def _get_noise(self, idx, w, h):
+        """Stable per-segment noise so the dissolve doesn't flicker between frames."""
+        s = max(1, int(self.segment_size))
+        key = (idx, s)
+        noise = self._noise.get(key)
+        if noise is None:
+            rng = random.Random(idx * 7919 + 13)
+            noise = Image.frombytes("L", (s, s), bytes(rng.randrange(256) for _ in range(s * s)))
+            self._noise[key] = noise
+        return noise.resize((w, h), NEAREST)
+
     def get_segment_photo(self, segment_index, base_pil_img):
-        """
-        Fast cached scaled/faded PhotoImage generation.
-        """
         if not self.is_destroying or segment_index not in self.detach_times:
             return ImageTk.PhotoImage(base_pil_img)
 
-        time_since_detach = time.time() - self.detach_times[segment_index]
-
-        if time_since_detach < self.deteriorate_delay:
-            seg_factor = 1.0
+        since = time.time() - self.detach_times[segment_index]
+        if since < self.deteriorate_delay:
+            decay = 0.0
+        elif self.deteriorate_duration <= 0:
+            decay = 1.0
         else:
-            decay_elapsed = time_since_detach - self.deteriorate_delay
-            if self.deteriorate_duration <= 0:
-                seg_factor = 0.0
-            else:
-                seg_factor = max(0.0, 1.0 - (decay_elapsed / self.deteriorate_duration))
+            decay = min(1.0, (since - self.deteriorate_delay) / self.deteriorate_duration)
 
-        if seg_factor <= 0.02:
+        if decay >= 0.98:
             return None
 
-        # Quantize scale and alpha to steps of 0.05 to minimize cache bloat and resize CPU load
-        q_scale_int = int(round(seg_factor * 20))
-        q_alpha_int = q_scale_int
-        
-        key = (id(base_pil_img), q_scale_int, q_alpha_int)
+        q = int(round(decay * 20))  # 0 = fresh, 20 = gone
+        key = (id(base_pil_img), segment_index, q)
 
         if key not in self._cache:
-            factor = q_scale_int / 20.0
-            w = max(1, int(self.segment_size * factor))
-            h = max(1, int(self.segment_size * factor))
-            
-            resized = base_pil_img.resize((w, h), BICUBIC)
+            if len(self._cache) > CACHE_LIMIT:
+                self._cache.clear()
+            t = q / 20.0
+            scale = 1.0 - (1.0 - SHRINK_END) * t
+            w = h = max(1, int(self.segment_size * scale))
 
-            # Fast transparency scaling
-            if factor < 0.99:
-                r, g, b, a = resized.split()
-                alpha_mult = factor
-                a = Image.eval(a, lambda v: int(v * alpha_mult))
-                resized.putalpha(a)
+            img = base_pil_img.convert("RGBA").resize((w, h), BICUBIC)
+            r, g, b, a = img.split()
 
-            self._cache[key] = ImageTk.PhotoImage(resized)
+            # 1) Rot toward ash color
+            ash = min(1.0, t * 1.5) * ASH_MAX_BLEND
+            if ash > 0:
+                rgb = Image.blend(Image.merge("RGB", (r, g, b)), Image.new("RGB", (w, h), ASH_COLOR), ash)
+                r, g, b = rgb.split()
+
+            # 2) Dissolve: random pixels drop out as decay grows
+            if t > 0:
+                threshold = int(255 * t * DISSOLVE_AMOUNT)
+                keep = self._get_noise(segment_index, w, h).point(lambda v: 255 if v >= threshold else 0)
+                a = ImageChops.multiply(a, keep)
+                # 3) Gentle overall fade in the last stretch
+                fade = 1.0 - t ** 3
+                a = a.point(lambda v: int(v * fade))
+
+            self._cache[key] = ImageTk.PhotoImage(Image.merge("RGBA", (r, g, b, a)))
 
         return self._cache[key]

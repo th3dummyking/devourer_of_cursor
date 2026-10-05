@@ -3,13 +3,17 @@ from PIL import Image, ImageDraw, ImageTk
 from config import (
     BASE_DIR,
     BODY_FILE,
+    BODY_FILE_2,
     HARD_EDGES,
     HEAD_FILE,
+    HEAD_FILE_2,
     IMAGE_DIR,
+    PHASE2_SEGMENT_SIZE,
     ROTATE_BODY,
     ROTATE_HEAD,
     SEGMENT_SIZE,
     TAIL_FILE,
+    TAIL_FILE_2,
 )
 
 RESAMPLING = getattr(Image, "Resampling", Image)
@@ -24,10 +28,10 @@ def harden(img):
     return img
 
 
-def fallback_image(color):
-    img = Image.new("RGBA", (SEGMENT_SIZE, SEGMENT_SIZE), (0, 0, 0, 0))
+def fallback_image(size, color):
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     ImageDraw.Draw(img).ellipse(
-        (2, 2, SEGMENT_SIZE - 3, SEGMENT_SIZE - 3),
+        (2, 2, size - 3, size - 3),
         fill=color,
         outline=(27, 77, 43, 255),
         width=2,
@@ -35,13 +39,21 @@ def fallback_image(color):
     return img
 
 
-def load_image(filename, fallback_color):
+def _open_image(filename, size):
     if filename:
         path = os.path.join(BASE_DIR, IMAGE_DIR, filename)
         if os.path.exists(path):
             img = Image.open(path).convert("RGBA")
-            return img.resize((SEGMENT_SIZE, SEGMENT_SIZE), LANCZOS)
-    return fallback_image(fallback_color)
+            return img.resize((size, size), LANCZOS)
+    return None
+
+
+def load_image(filename, size, fallback_color, fallback_filename=None):
+    """Loads `filename` at `size`. If missing, tries `fallback_filename`, then a plain circle."""
+    img = _open_image(filename, size)
+    if img is None and fallback_filename:
+        img = _open_image(fallback_filename, size)
+    return img if img is not None else fallback_image(size, fallback_color)
 
 
 _rotation_cache = {}
@@ -68,9 +80,19 @@ def precalculate_rotations(name, base_img, allow_rotate):
         _photo_cache[name][deg] = ImageTk.PhotoImage(rotated)
 
 
-head_img = load_image(HEAD_FILE, (120, 220, 90, 255))
-body_img = load_image(BODY_FILE, (70, 170, 80, 255))
-tail_img = load_image(TAIL_FILE, (70, 170, 80, 255)) if TAIL_FILE else body_img
+# Phase 1 images
+head_img = load_image(HEAD_FILE, SEGMENT_SIZE, (120, 220, 90, 255))
+body_img = load_image(BODY_FILE, SEGMENT_SIZE, (70, 170, 80, 255))
+tail_img = load_image(TAIL_FILE, SEGMENT_SIZE, (70, 170, 80, 255)) if TAIL_FILE else body_img
+
+# Phase 2 images (head_2 / body_2 / tail_2). Missing files fall back to the phase 1 image, scaled up.
+head_img2 = load_image(HEAD_FILE_2, PHASE2_SEGMENT_SIZE, (220, 90, 90, 255), fallback_filename=HEAD_FILE)
+body_img2 = load_image(BODY_FILE_2, PHASE2_SEGMENT_SIZE, (170, 70, 70, 255), fallback_filename=BODY_FILE)
+tail_img2 = (
+    load_image(TAIL_FILE_2, PHASE2_SEGMENT_SIZE, (170, 70, 70, 255), fallback_filename=TAIL_FILE)
+    if (TAIL_FILE_2 or TAIL_FILE)
+    else body_img2
+)
 
 
 def init_assets():
@@ -78,6 +100,10 @@ def init_assets():
     precalculate_rotations("head", head_img, ROTATE_HEAD)
     precalculate_rotations("body", body_img, ROTATE_BODY)
     precalculate_rotations("tail", tail_img, ROTATE_BODY)
+    # Phase 2 sets use the same names with a "2" suffix
+    precalculate_rotations("head2", head_img2, ROTATE_HEAD)
+    precalculate_rotations("body2", body_img2, ROTATE_BODY)
+    precalculate_rotations("tail2", tail_img2, ROTATE_BODY)
 
 
 def get_base_photo(name, angle_deg):

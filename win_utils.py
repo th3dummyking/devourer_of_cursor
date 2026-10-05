@@ -52,3 +52,7 @@ def is_key_down(vk):
 
 def hotkey_pressed():
     return is_key_down(0x11) and is_key_down(0x12) and is_key_down(0x51)  # Ctrl+Alt+Q
+
+
+def phase_hotkey_down():
+    return is_key_down(0x11) and is_key_down(0x12) and is_key_down(0x50)  # Ctrl+Alt+P

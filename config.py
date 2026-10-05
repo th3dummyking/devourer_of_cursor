@@ -39,6 +39,13 @@ DEFAULT_CONFIG = {
     "body_file": "body.png",
     "tail_file": "tail.png",
     "dialogue_file": "dog_lines.txt",
+    "dialogue_file_chase": "dog_lines_chase.txt",
+    "dialogue_file_phase2": "dog_lines_phase2.txt",
+    "phase2_scale": 1.5,
+    "phase2_head_file": "head_2.png",
+    "phase2_body_file": "body_2.png",
+    "phase2_tail_file": "tail_2.png",
+    "phase2_dash_speed_mult": 1.0,
     "speech_interval_min": 3.0,
     "speech_interval_max": 5.0,
     "speech_duration": 2.0,
@@ -111,6 +118,9 @@ IMAGE_DIR = CFG["image_dir"]
 HEAD_FILE = CFG["head_file"]
 BODY_FILE = CFG["body_file"]
 TAIL_FILE = CFG["tail_file"]
+HEAD_FILE_2 = CFG.get("phase2_head_file", "head_2.png")
+BODY_FILE_2 = CFG.get("phase2_body_file", "body_2.png")
+TAIL_FILE_2 = CFG.get("phase2_tail_file", "tail_2.png")
 
 # AI Movement Constants
 WANDER_SPEED = 6.0
@@ -125,7 +135,9 @@ RAD_TO_DEG = 180.0 / math.pi
 PI_HALF = math.pi / 2.0
 
 # Dialogue / Speech Constants
-DIALOGUE_FILE = CFG.get("dialogue_file", "dog_lines.txt")
+DIALOGUE_FILE = CFG.get("dialogue_file", "dog_lines.txt")                       # normal state
+DIALOGUE_FILE_CHASE = CFG.get("dialogue_file_chase", "dog_lines_chase.txt")     # following state
+DIALOGUE_FILE_PHASE2 = CFG.get("dialogue_file_phase2", "dog_lines_phase2.txt")  # second phase
 SPEECH_INTERVAL_MIN = float(CFG.get("speech_interval_min", 3.0))
 SPEECH_INTERVAL_MAX = float(CFG.get("speech_interval_max", 8.0))
 SPEECH_DURATION = float(CFG.get("speech_duration", 4.0))
@@ -138,3 +150,40 @@ SPEECH_OFFSET_Y = float(CFG.get("speech_offset_y", 30))
 SPEECH_SHAKE_AMOUNT = float(CFG.get("speech_shake_amount", 3.0))
 SPEECH_BASE_COLOR = CFG.get("speech_color", "#947CE9")  # Purple hex
 SPEECH_OPACITY = 1.0  # 0.0 (fully invisible) to 1.0 (fully opaque)
+
+# Phase System
+PHASE2_SCALE = float(CFG.get("phase2_scale", 1.5))
+PHASE2_DASH_SPEED_MULT = float(CFG.get("phase2_dash_speed_mult", 1.0))
+
+
+def scaled_params(scale):
+    """
+    Every value that depends on the worm's physical size, multiplied by `scale`.
+    Phase 1 = scale 1.0, phase 2 = PHASE2_SCALE. Time-based values (durations,
+    fps) and angle-based values (turn smoothing, max bend) are NOT scaled.
+    Keys are the module-level constant names so the main script can globals().update() them.
+    """
+    seg = max(1, int(round(SEGMENT_SIZE * scale)))
+    return {
+        "SCALE": scale,
+        "SEGMENT_SIZE": seg,
+        "SPACING": int(seg * CFG["spacing_ratio"]),
+        "BASE_SPEED": BASE_SPEED * scale,
+        "MAX_SPEED": MAX_SPEED * scale,
+        "WANDER_SPEED": WANDER_SPEED * scale,
+        "WIGGLE": WIGGLE * scale,
+        "WANDER_ARRIVE_DIST": WANDER_ARRIVE_DIST * scale,
+        "DECEL_DIST": DECEL_DIST * scale,
+        "ACCEL_DIST": ACCEL_DIST * scale,
+        "EVADE_THREAT_DIST": EVADE_THREAT_DIST * scale,
+        "SPAWN_MARGIN": SPAWN_MARGIN * scale,
+        "BREAK_POP_FORCE": BREAK_POP_FORCE * scale,
+        "DYING_SPEED": DYING_SPEED * scale,
+        "DYING_GRAVITY": DYING_GRAVITY * scale,
+        "SPEECH_FONT_SIZE": max(1, int(round(SPEECH_FONT_SIZE * scale))),
+        "SPEECH_OFFSET_Y": SPEECH_OFFSET_Y * scale,
+        "SPEECH_SHAKE_AMOUNT": SPEECH_SHAKE_AMOUNT * scale,
+    }
+
+
+PHASE2_SEGMENT_SIZE = scaled_params(PHASE2_SCALE)["SEGMENT_SIZE"]

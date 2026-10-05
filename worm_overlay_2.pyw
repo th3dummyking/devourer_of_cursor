@@ -17,6 +17,8 @@ from config import (
     DETERIORATE_DELAY,
     DETERIORATE_DURATION,
     DIALOGUE_FILE,
+    DIALOGUE_FILE_CHASE,
+    DIALOGUE_FILE_PHASE2,
     DT,
     DYING_GRAVITY,
     DYING_SPEED,
@@ -54,7 +56,10 @@ from config import (
     WANDER_SPEED,
     WIGGLE,
     SPEECH_OPACITY,
-    SPEECH_BASE_COLOR
+    SPEECH_BASE_COLOR,
+    PHASE2_DASH_SPEED_MULT,
+    PHASE2_SCALE,
+    scaled_params,
 )
 from destruction import DestructionAnimator
 import win_utils
@@ -64,7 +69,7 @@ CORNER_WIDTH_RATIO = 0.15   # Fraction of screen width used for corner targets
 CORNER_HEIGHT_RATIO = 0.15  # Fraction of screen height used for corner targets
 
 # Screen Circuit Mode Configuration (Top-Left -> Top-Right -> Bottom-Right -> Bottom-Left)
-MARGIN = 30
+MARGIN = -10
 CIRCUIT_WAYPOINTS = [
     (MARGIN, MARGIN),                      # Top-Left
     (win_utils.VW - MARGIN, MARGIN),       # Top-Right
@@ -73,15 +78,37 @@ CIRCUIT_WAYPOINTS = [
 ]
 CIRCUIT_ARRIVE_DIST = 80.0  # Distance before starting bezier curve turn
 
+# Phase Change (Ctrl+Alt+P) Configuration
+PHASE_DASH_TIMEOUT = 4.0          # Failsafe: force the respawn if the dash takes longer than this (seconds)
+PHASE_DASH_TURN_PENALTY = 400.0   # Higher = prefers the exit edge the worm already faces, lower = nearest edge
+SPEECH_STATE_SWITCH_DELAY = 0.5   # Seconds before the first line after the speech state changes
+
 # Box Mode Speed & Movement Controls
 CIRCUIT_SPEED_MULTIPLIER = 1.3   # Change this to speed up or slow down Box Mode (e.g. 1.2, 2.5)
 BODY_FOLLOW_STIFFNESS = 1     # Body curvature ratio (0.20 = soft/flattened, 1.0 = sharp follow)
 # Circuit Wave / Zigzag Configuration
 WAVE_ENABLED = True           # Toggle wave motion on/off
-WAVE_FREQUENCY = 4.2          # Speed/frequency of oscillations (higher = faster wiggles)
-WAVE_AMPLITUDE = 0.6         # Offset angle in radians (~20 deg max deviation)rm
-CIRCUIT_STEER_RATE = 0.20     # Steering responsiveness while tracking the wave
+WAVE_FREQUENCY = 4.5          # Speed/frequency of oscillations (higher = faster wiggles)
+WAVE_AMPLITUDE = 0.7         # Offset angle in radians (~20 deg max deviation)
+CIRCUIT_STEER_RATE = 0.30     # Steering responsiveness while tracking the wave
 
+# Death Animation
+DEATH_CRAWL_SPEED = 3.0      # initial head speed while dying
+DEATH_CRAWL_DECAY = 2.0      # higher = stops crawling sooner
+DEATH_WRITHE_AMOUNT = 0.25   # head wobble in radians
+DEATH_WRITHE_FREQ = 16.0
+EXPLOSION_PARTICLES = 13      # per segment
+EXPLOSION_SPEED = (2.0, 6.5)
+EXPLOSION_SIZE = (5.0, 10.0)
+# EXPLOSION_SIZE = (2.0, 5.0)
+EXPLOSION_LIFE = (0.35, 0.6)
+EXPLOSION_GRAVITY = 0.18
+EXPLOSION_FLASH_SIZE = 10.0  # brief bright puff at the pop point
+EXPLOSION_COLORS = ["#2965f2", "#6e0591", "#BF52EA", "#cc9bfa"]
+EXPLOSION_OPACITY = 0.4      # 0.0-1.0, starting opacity (fades out over each particle's life)
+EXPLOSION_PIXEL = 4          # grid size in px; bigger = chunkier pixels
+# (min opacity, stipple pattern), checked top to bottom
+STIPPLE_LEVELS = [(0.88, ""), (0.62, "gray75"), (0.37, "gray50"), (0.18, "gray25"), (0.0, "gray12")]
 # Window Setup
 KEY = "#010101"
 root = tk.Tk()
@@ -113,17 +140,39 @@ win_utils.make_click_through(HWND)
 win_utils.keep_on_top(HWND)
 
 # Speech Bubble / Text State Setup
-dialogue_lines = []
-dialogue_path = os.path.join(BASE_DIR, DIALOGUE_FILE)
+# Three speech states: "normal", "chase" (following the cursor), "phase2" (second phase)
+DIALOGUE_PATHS = {
+    "normal": os.path.join(BASE_DIR, DIALOGUE_FILE),
+    "chase": os.path.join(BASE_DIR, DIALOGUE_FILE_CHASE),
+    "phase2": os.path.join(BASE_DIR, DIALOGUE_FILE_PHASE2),
+}
+dialogue_pools = {"normal": [], "chase": [], "phase2": []}
+
 
 def load_dialogue_lines():
-    global dialogue_lines
-    if os.path.exists(dialogue_path):
-        try:
-            with open(dialogue_path, "r", encoding="utf-8") as f:
-                dialogue_lines = [line.strip() for line in f if line.strip()]
-        except Exception as e:
-            print(f"Error reading {DIALOGUE_FILE}: {e}")
+    for state, path in DIALOGUE_PATHS.items():
+        lines = []
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = [line.strip() for line in f if line.strip()]
+            except Exception as e:
+                print(f"Error reading {os.path.basename(path)}: {e}")
+        dialogue_pools[state] = lines
+
+
+def get_dialogue_pool(state):
+    # An empty/missing file for a state falls back to the normal lines
+    return dialogue_pools.get(state) or dialogue_pools["normal"]
+
+
+def get_speech_state():
+    if phase == 2:
+        return "phase2"
+    if chase_mode:
+        return "chase"
+    return "normal"
+
 
 load_dialogue_lines()
 
@@ -141,6 +190,7 @@ speech_start_time = 0.0
 next_speech_time = time.time() + random.uniform(SPEECH_INTERVAL_MIN, SPEECH_INTERVAL_MAX)
 speech_spawn_x = 0.0
 speech_spawn_y = 0.0
+speech_state = "normal"
 
 
 def hex_to_rgb(hex_str):
@@ -161,12 +211,14 @@ def blend_hex_color(foreground_hex, background_hex, alpha):
     return rgb_to_hex(blended)
 
 
-def trigger_speech(x, y):
+def trigger_speech(x, y, state):
     global current_speech_line, speech_start_time, speech_spawn_x, speech_spawn_y
-    if not dialogue_lines:
+    pool = get_dialogue_pool(state)
+    if not pool:
         load_dialogue_lines()
-    if dialogue_lines:
-        current_speech_line = random.choice(dialogue_lines)
+        pool = get_dialogue_pool(state)
+    if pool:
+        current_speech_line = random.choice(pool)
         speech_start_time = time.time()
         speech_spawn_x = x
         speech_spawn_y = y + SPEECH_OFFSET_Y
@@ -174,17 +226,25 @@ def trigger_speech(x, y):
 
 
 def update_speech():
-    global next_speech_time, current_speech_line
+    global next_speech_time, current_speech_line, speech_state
     now = time.time()
 
-    if quit_flag or animator.is_destroying:
+    if quit_flag or animator.is_destroying or dash_active:
         canvas.itemconfig(speech_text_id, state="hidden")
         return
+
+    # State changed (normal <-> chase, or phase 2 began): drop the old line, speak from the new pool soon
+    state = get_speech_state()
+    if state != speech_state:
+        speech_state = state
+        current_speech_line = ""
+        canvas.itemconfig(speech_text_id, state="hidden")
+        next_speech_time = now + SPEECH_STATE_SWITCH_DELAY
 
     # Trigger new speech line if due
     if not current_speech_line and now >= next_speech_time:
         head_x, head_y = segments[0][0], segments[0][1]
-        trigger_speech(head_x, head_y)
+        trigger_speech(head_x, head_y, state)
         next_speech_time = now + SPEECH_DURATION + random.uniform(SPEECH_INTERVAL_MIN, SPEECH_INTERVAL_MAX)
 
     if current_speech_line:
@@ -228,15 +288,24 @@ def compute_spawn_point():
         return random.uniform(0, win_utils.VW), win_utils.VH + SPAWN_MARGIN
 
 
-cursor_x, cursor_y = win_utils.cursor_pos()
-sx, sy = compute_spawn_point()
+segments = []
+segment_angles = []
 
-_ddx, _ddy = cursor_x - sx, cursor_y - sy
-_ddist = math.hypot(_ddx, _ddy) or 1.0
-_ux, _uy = _ddx / _ddist, _ddy / _ddist
 
-segments = [[sx - _ux * i * SPACING, sy - _uy * i * SPACING] for i in range(NUM_SEGMENTS)]
-segment_angles = [math.atan2(_uy, _ux)] * NUM_SEGMENTS
+def spawn_worm():
+    """(Re)builds the whole chain just off-screen, heading toward the cursor. Uses the current phase's size."""
+    cursor_x, cursor_y = win_utils.cursor_pos()
+    sx, sy = compute_spawn_point()
+
+    ddx, ddy = cursor_x - sx, cursor_y - sy
+    ddist = math.hypot(ddx, ddy) or 1.0
+    ux, uy = ddx / ddist, ddy / ddist
+
+    segments[:] = [[sx - ux * i * SPACING, sy - uy * i * SPACING] for i in range(NUM_SEGMENTS)]
+    segment_angles[:] = [math.atan2(uy, ux)] * NUM_SEGMENTS
+
+
+spawn_worm()
 items = [canvas.create_image(-100, -100) for _ in range(NUM_SEGMENTS)]
 
 broken_physics = [
@@ -269,6 +338,13 @@ current_corner_idx = None
 
 circuit_idx = 0  # Index for Screen Circuit Mode
 
+phase = 1            # 1 = first phase, 2 = second phase
+SCALE = 1.0          # Size multiplier of the current phase (set by apply_phase)
+dash_active = False  # True while the worm dashes off-screen before respawning in the other phase
+dash_target_phase = 2
+dash_angle = 0.0
+dash_start_time = 0.0
+
 wander_mode = False
 chase_mode = False
 box_mode = False
@@ -283,6 +359,7 @@ current_evade_speed = WANDER_SPEED
 _wm_was_down = False
 _cm_was_down = False
 _rm_was_down = False
+_phase_was_down = False
 
 
 def request_quit():
@@ -292,6 +369,69 @@ def request_quit():
         animator.start()
         if tray_icon:
             tray_icon.stop()
+
+
+def apply_phase(new_phase):
+    """Swap every size-dependent value to the given phase's scale."""
+    global phase
+    phase = new_phase
+    scale = PHASE2_SCALE if new_phase == 2 else 1.0
+    # Overwrites SEGMENT_SIZE, SPACING, speeds, distances, wiggle, speech sizes, SCALE...
+    globals().update(scaled_params(scale))
+    animator.segment_size = SEGMENT_SIZE  # keeps the death animation sized correctly
+    canvas.itemconfig(speech_text_id, font=(SPEECH_FONT_FAMILY, SPEECH_FONT_SIZE, SPEECH_FONT_WEIGHT))
+
+
+def reset_motion_state():
+    global chase_time, wander_target, wander_pause_until, wander_start_pos
+    global last_evade_check, evade_speed_last_check, locked_evade_speed, current_evade_speed
+    chase_time = 0.0
+    wander_target = None
+    wander_pause_until = 0.0
+    wander_start_pos = None
+    last_evade_check = 0.0
+    evade_speed_last_check = 0.0
+    locked_evade_speed = WANDER_SPEED
+    current_evade_speed = WANDER_SPEED
+
+
+def start_phase_change():
+    """Pick an exit edge (nearest, biased toward the way the head already faces) and start the dash."""
+    global dash_active, dash_angle, dash_start_time, dash_target_phase
+    dash_target_phase = 2 if phase == 1 else 1  # Ctrl+Alt+P toggles between the two phases
+    head = segments[0]
+    heading = segment_angles[0]
+    best = None
+    for edge_angle, edge_dist in (
+        (math.pi, head[0]),
+        (0.0, win_utils.VW - head[0]),
+        (-PI_HALF, head[1]),
+        (PI_HALF, win_utils.VH - head[1]),
+    ):
+        turn = abs((edge_angle - heading + math.pi) % TWO_PI - math.pi)
+        score = max(0.0, edge_dist) + PHASE_DASH_TURN_PENALTY * turn
+        if best is None or score < best[0]:
+            best = (score, edge_angle)
+    dash_angle = best[1]
+    dash_start_time = time.time()
+    dash_active = True
+
+
+def dash_cleared_screen():
+    margin = SEGMENT_SIZE
+    for x, y in segments:
+        if -margin <= x <= win_utils.VW + margin and -margin <= y <= win_utils.VH + margin:
+            return False
+    return True
+
+
+def finish_phase_change():
+    """Worm is fully off-screen: despawn, swap to the target phase size/images, respawn from an edge."""
+    global dash_active
+    dash_active = False
+    apply_phase(dash_target_phase)
+    spawn_worm()
+    reset_motion_state()
 
 
 def wm_toggle_pressed():
@@ -372,12 +512,73 @@ def relax_chain(max_bend_rad=None):
         cur[1] = prev[1] + math.sin(angle) * SPACING
         prev_dir = angle
 
+particles = []
+def _stipple_for(alpha):
+    for threshold, name in STIPPLE_LEVELS:
+        if alpha >= threshold:
+            return name
+    return "gray12"
+
+
+def _add_particle(x, y, vx, vy, size, life, color, gravity):
+    px = EXPLOSION_PIXEL
+    cells = max(1, round(size / px))
+    stip = _stipple_for(EXPLOSION_OPACITY)
+    gx, gy = round(x / px) * px, round(y / px) * px
+    item = canvas.create_rectangle(gx, gy, gx + cells * px, gy + cells * px,
+                                   fill=color, outline="", stipple=stip)
+    canvas.tag_lower(item)  # draw under the worm pieces so they stay visible
+    particles.append({"id": item, "x": x, "y": y, "vx": vx, "vy": vy, "cells": cells,
+                      "born": time.time(), "life": life, "g": gravity, "stip": stip})
+
+
+def spawn_explosion(x, y):
+    # Quick bright flash
+    _add_particle(x, y, 0, 0, EXPLOSION_FLASH_SIZE * SCALE, 0.15, "#ffffff", 0.0)
+    for _ in range(EXPLOSION_PARTICLES):
+        ang = random.uniform(0, TWO_PI)
+        spd = random.uniform(*EXPLOSION_SPEED) * SCALE
+        _add_particle(
+            x, y,
+            math.cos(ang) * spd, math.sin(ang) * spd,
+            random.uniform(*EXPLOSION_SIZE) * SCALE,
+            random.uniform(*EXPLOSION_LIFE),
+            random.choice(EXPLOSION_COLORS),
+            EXPLOSION_GRAVITY * SCALE,
+        )
+
+
+
+
+def update_particles():
+    now = time.time()
+    px = EXPLOSION_PIXEL
+    alive = []
+    for p in particles:
+        t = (now - p["born"]) / p["life"]
+        if t >= 1.0:
+            canvas.delete(p["id"])
+            continue
+        p["vy"] += p["g"]
+        p["vx"] *= 0.95
+        p["x"] += p["vx"]
+        p["y"] += p["vy"]
+        c = max(1, round(p["cells"] * (1.0 - t)))
+        gx, gy = round(p["x"] / px) * px, round(p["y"] / px) * px
+        canvas.coords(p["id"], gx, gy, gx + c * px, gy + c * px)
+        stip = _stipple_for(EXPLOSION_OPACITY * (1.0 - t))
+        if stip != p["stip"]:
+            canvas.itemconfig(p["id"], stipple=stip)
+            p["stip"] = stip
+        alive.append(p)
+    particles[:] = alive
 
 def update_step():
     global tick, chase_time, idle_start, wander_mode, chase_mode, box_mode, evade_mode
     global wander_target, wander_pause_until, wander_start_pos, circuit_idx
     global last_evade_check, locked_evade_angle
     global evade_speed_last_check, locked_evade_speed, current_evade_speed
+    global _phase_was_down
 
     tick += 1
 
@@ -405,20 +606,33 @@ def update_step():
             chase_mode = False
             evade_mode = not box_mode
 
+        phase_down = win_utils.phase_hotkey_down()
+        if phase_down and not _phase_was_down and not dash_active:
+            start_phase_change()
+        _phase_was_down = phase_down
+
         now = time.time()
         head = segments[0]
         target_angle = segment_angles[0]
         target_speed = 0.0
         steer_rate = TURN_SMOOTHING
 
-        if box_mode:
+        if dash_active:
+            # Phase change: fly straight out through the chosen edge at full speed
+            target_speed = MAX_SPEED * PHASE2_DASH_SPEED_MULT
+            target_angle = dash_angle
+            steer_rate = 0.25
+            chase_time = 0.0
+            idle_start = None
+
+        elif box_mode:
             # Circuit path: Top-Left -> Top-Right -> Bottom-Right -> Bottom-Left -> Repeat
             tx, ty = CIRCUIT_WAYPOINTS[circuit_idx]
             dx, dy = tx - head[0], ty - head[1]
             dist = math.hypot(dx, dy)
 
             # Advance to the next corner waypoint when nearing the current target
-            if dist < CIRCUIT_ARRIVE_DIST:
+            if dist < CIRCUIT_ARRIVE_DIST * SCALE:
                 circuit_idx = (circuit_idx + 1) % len(CIRCUIT_WAYPOINTS)
                 tx, ty = CIRCUIT_WAYPOINTS[circuit_idx]
                 dx, dy = tx - head[0], ty - head[1]
@@ -484,7 +698,7 @@ def update_step():
             tx, ty = win_utils.cursor_pos()
             dx, dy = tx - head[0], ty - head[1]
             dist = math.hypot(dx, dy)
-            STOP_RADIUS = 25.0
+            STOP_RADIUS = 25.0 * SCALE
 
             if dist > STOP_RADIUS:
                 chase_time += DT
@@ -496,7 +710,7 @@ def update_step():
                     target_speed = BASE_SPEED + (MAX_SPEED - BASE_SPEED) * curve
 
                 target_angle = math.atan2(dy, dx)
-                proximity_factor = min(1.0, dist / 200.0)
+                proximity_factor = min(1.0, dist / (200.0 * SCALE))
                 steer_rate = TURN_SMOOTHING + (1.0 - TURN_SMOOTHING) * (1.0 - proximity_factor)
                 idle_start = None
             else:
@@ -512,8 +726,8 @@ def update_step():
 
             EVADE_PATH_COOLDOWN = 0.8
             EVADE_SPEED_COOLDOWN = 0.5
-            EVADE_HOLD_DIST = 350.0
-            IMMEDIATE_THREAT_DIST = 50.0
+            EVADE_HOLD_DIST = 350.0 * SCALE
+            IMMEDIATE_THREAT_DIST = 50.0 * SCALE
 
             if (now - last_evade_check) >= EVADE_PATH_COOLDOWN or dist < IMMEDIATE_THREAT_DIST:
                 last_evade_check = now
@@ -547,7 +761,7 @@ def update_step():
 
         # Boundary Steering
         steering_x, steering_y = 0.0, 0.0
-        if not chase_mode and not box_mode:
+        if not chase_mode and not box_mode and not dash_active:
             margin = SPAWN_MARGIN
             if head[0] < margin:
                 steering_x += (margin - head[0]) / margin
@@ -579,48 +793,41 @@ def update_step():
             if chase_mode:
                 tx, ty = win_utils.cursor_pos()
                 dist_to_cursor = math.hypot(tx - head[0], ty - head[1])
-                step_dist = min(step_dist, max(1.0, dist_to_cursor - 25.0))
+                step_dist = min(step_dist, max(1.0, dist_to_cursor - 25.0 * SCALE))
 
             head[0] += math.cos(new_angle) * step_dist
             head[1] += math.sin(new_angle) * step_dist
 
         relax_chain(MAX_BEND_RAD)
 
+        if dash_active and (dash_cleared_screen() or now - dash_start_time > PHASE_DASH_TIMEOUT):
+            finish_phase_change()
+
     elif BREAK_APART:
+        # Dying crawl: the head keeps moving, slowing down and writhing, and the body gets dragged along
+        if not broken_physics[0]["detached"]:
+            t = animator.elapsed
+            speed = DEATH_CRAWL_SPEED * SCALE * math.exp(-DEATH_CRAWL_DECAY * t)
+            segment_angles[0] += math.sin(t * DEATH_WRITHE_FREQ) * DEATH_WRITHE_AMOUNT * math.exp(-1.5 * t)
+            step = speed * DT * 60.0
+            segments[0][0] += math.cos(segment_angles[0]) * step
+            segments[0][1] += math.sin(segment_angles[0]) * step
+
         for i in range(NUM_SEGMENTS):
             p = broken_physics[i]
             if animator.is_segment_started(i):
                 if not p["detached"]:
                     p["detached"] = True
-                    p["detach_time"] = time.time()
-                    p["vx"] = random.uniform(-1.5, 1.5) * DYING_SPEED
-                    p["vy"] = -random.uniform(0.5, 1.0) * BREAK_POP_FORCE
-                    p["rot"] = segment_angles[i] * RAD_TO_DEG
-                    p["rot_speed"] = random.uniform(-180.0, 180.0)
+                    ...  # existing code unchanged
                     animator.mark_detached(i)
-
-            if p["detached"]:
-                p["vy"] += DYING_GRAVITY * DT
-                segments[i][0] += p["vx"]
-                segments[i][1] += p["vy"]
-                p["rot"] += p["rot_speed"] * DT
-
-        for i in range(1, NUM_SEGMENTS):
-            if not broken_physics[i]["detached"] and not broken_physics[i - 1]["detached"]:
-                prev, cur = segments[i - 1], segments[i]
-                dx, dy = prev[0] - cur[0], prev[1] - cur[1]
-                d = math.hypot(dx, dy)
-                if d > 0.0:
-                    scale = SPACING / d
-                    cur[0] = prev[0] - dx * scale
-                    cur[1] = prev[1] - dy * scale
-    else:
+                    spawn_explosion(segments[i][0], segments[i][1])   # <-- new line    else:
         for i in range(NUM_SEGMENTS):
             if animator.is_segment_started(i):
                 animator.mark_detached(i)
         relax_chain(MAX_BEND_RAD)
 
     update_speech()
+    update_particles()
     draw()
 
 
@@ -666,6 +873,8 @@ def draw():
             angle = broken_physics[i]["rot"]
 
         tag = "head" if i == 0 else ("tail" if i == NUM_SEGMENTS - 1 else "body")
+        if phase == 2:
+            tag += "2"
 
         if animator.is_destroying:
             base_pil = get_base_photo(tag, angle)
