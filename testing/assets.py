@@ -81,12 +81,12 @@ def precalculate_rotations(name, base_img, allow_rotate):
 
 
 # Phase 1 images
-head_img = load_image(HEAD_FILE, SEGMENT_SIZE, (120, 220, 90, 255))
+head_img = load_image(HEAD_FILE, SEGMENT_SIZE, (320, 320, 90, 255))
 body_img = load_image(BODY_FILE, SEGMENT_SIZE, (70, 170, 80, 255))
 tail_img = load_image(TAIL_FILE, SEGMENT_SIZE, (70, 170, 80, 255)) if TAIL_FILE else body_img
 
 # Phase 2 images (head_2 / body_2 / tail_2). Missing files fall back to the phase 1 image, scaled up.
-head_img2 = load_image(HEAD_FILE_2, PHASE2_SEGMENT_SIZE, (220, 90, 90, 255), fallback_filename=HEAD_FILE)
+head_img2 = load_image(HEAD_FILE_2, PHASE2_SEGMENT_SIZE, (320, 90, 90, 355), fallback_filename=HEAD_FILE)
 body_img2 = load_image(BODY_FILE_2, PHASE2_SEGMENT_SIZE, (170, 70, 70, 255), fallback_filename=BODY_FILE)
 tail_img2 = (
     load_image(TAIL_FILE_2, PHASE2_SEGMENT_SIZE, (170, 70, 70, 255), fallback_filename=TAIL_FILE)
